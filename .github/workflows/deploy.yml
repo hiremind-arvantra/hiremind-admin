@@ -1,0 +1,86 @@
+name: Deploy platform admin panel
+
+# Every push to Dev or main builds the image on GitHub's runners and deploys it.
+#
+# The image is NEVER built on the VPS. 2 vCPU and 8GB already run Postgres, Redis, three
+# JVMs and the AI stack; a Next.js build there competes with all of them and has been
+# OOM-killed before. The server only pulls and restarts one container.
+on:
+  push:
+    branches: [main, Dev]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hiremind-admin
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          # Compose hostnames, not secrets — they only resolve on the private network.
+          # They are build args because rewrites() is evaluated at build time.
+          build-args: |
+            USERS_API_URL=http://users-api:5001/user-service
+            COMPANY_API_URL=http://company-api:5003/company-service
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: publish
+    # Only the production branch touches the server; Dev stops after publishing, so the
+    # image exists to deploy by hand without changing what is live.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull and restart on the VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /root/hiremind_dev
+            docker compose -f docker-compose.prod.yml pull admin-web
+            # --no-deps so a frontend deploy never restarts the APIs beneath it.
+            docker compose -f docker-compose.prod.yml up -d --no-deps admin-web
+            docker image prune -f
+
+      - name: Wait for the hostname to answer
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' https://karupaswamy.hiremind.co.in/login || true)
+            echo "attempt $i: $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "karupaswamy.hiremind.co.in did not return 200"; exit 1
